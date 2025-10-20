@@ -1,24 +1,27 @@
 from __future__ import annotations
+
+import asyncio
+import math
+import mimetypes
 import os
-import google.generativeai as genai
 import re
+import sys
 import uuid
-import asyncio, sys
-from functools import lru_cache
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List
+import google.generativeai as genai
 from dotenv import load_dotenv
-from langchain_community.document_loaders.parsers import images
-from tqdm import tqdm
-from sqlalchemy import create_engine, text as sql_text
-from langchain_community.document_loaders import PyPDFLoader
+from google import genai
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Qdrant
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-import math
+from sqlalchemy import create_engine, text as sql_text
+from tqdm import tqdm
 
 # ------------------------- Config -------------------------
 load_dotenv()
@@ -66,11 +69,13 @@ MIN_SECTION_LEN = 400  # merge tiny sections into neighbors
 
 VI_CHARS = "ăâđêôơưĂÂĐÊÔƠƯáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộơớờởỡợúùủũụứừửữựýỳỷỹỵ"
 
+
 def _est_tokens(text: str) -> int:
     if not text:
         return 0
     # xấp xỉ ~4 ký tự / token
     return max(1, math.ceil(len(text) / 4))
+
 
 def _est_tokens_batch(texts) -> int:
     return sum(_est_tokens(t) for t in (texts or []))
@@ -449,48 +454,60 @@ ENABLE_VISION_COVER = bool(int(os.getenv("ENABLE_VISION_COVER", "1")))
 VISION_MODEL = os.getenv("GENAI_VISION_MODEL", os.getenv("GENAI_SUMMARY_MODEL", "gemini-2.5-flash"))
 VISION_MAX_PAGES = int(os.getenv("VISION_MAX_PAGES", "10"))
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+
+def _gemini_client():
+    return genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
 
 
-def _vision_extract_meta_from_pdf(pdf_path: Path) -> dict:
+def _read_image_file(path: Path) -> Tuple[bytes, str]:
+    mime, _ = mimetypes.guess_type(str(path))
+    if not mime:
+        mime = "image/png"
+    with open(path, "rb") as f:
+        data = f.read()
+    return data, mime
+
+
+def _gemini_image_infer(prompt: str, image_bytes: bytes, mime: str, model_name: str) -> str:
+    client = _gemini_client()
+    part = genai.types.Part.from_bytes(data=image_bytes, mime_type=mime)
+    resp = client.models.generate_content(model=model_name, contents=[prompt, part])
+    return (getattr(resp, "text", None) or "").strip()
+
+
+def _vision_extract_meta_from_image(img_path: Path) -> dict:
     """
-    Dùng Gemini File API đọc trực tiếp PDF (không cần PyMuPDF).
-    Trả về dict: {title, author, year} (có thể None).
+    Đọc 1 ảnh (bìa/scans) bằng Gemini Image (google-genai).
+    Trả về: {title, author, year} (có thể None).
     """
     try:
         api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         if not api_key:
-            print("[VISION] missing GOOGLE_API_KEY/GEMINI_API_KEY")
+            print("[VISION-IMG] missing GOOGLE_API_KEY/GEMINI_API_KEY")
             return {}
 
-        genai.configure(api_key=api_key)
         model_name = os.getenv("GENAI_VISION_MODEL", "gemini-2.5-flash")
-        model = genai.GenerativeModel(model_name)
-
-        # Upload PDF trực tiếp
-        gfile = genai.upload_file(path=str(pdf_path), mime_type="application/pdf")
-
         prompt = (
-            "You are an OCR+layout model reading ONLY the provided PDF. "
-            "Focus on cover and front-matter (roughly first 10 pages). "
+            "You are reading ONLY the provided image(s) of a book cover or front-matter. "
             "Extract bibliographic metadata if visible: title, author(s), publication year. "
-            "Return STRICT JSON with keys: title, author, year. "
-            "Values may be null if absent. Year must be 4 digits if exists."
+            "Return STRICT JSON with keys: title, author, year. Values may be null; "
+            "year must be 4 digits if present."
         )
-        resp = model.generate_content([prompt, gfile])
-        text = (resp.text or "").strip()
+
+        data, mime = _read_image_file(img_path)
+        raw = _gemini_image_infer(prompt, data, mime, model_name)
 
         import json, re
         data = {}
         try:
-            data = json.loads(text)
+            data = json.loads(raw)
         except Exception:
-            m = re.search(r"\{.*\}", text, re.S)
+            m = re.search(r"\{.*\}", raw, re.S)
             data = json.loads(m.group(0)) if m else {}
 
-        title  = data.get("title")  or None
+        title = data.get("title") or None
         author = data.get("author") or None
-        year   = data.get("year")   or None
+        year = data.get("year") or None
         try:
             year = int(year) if year is not None else None
             if year and not (1000 <= year <= 2100):
@@ -498,43 +515,34 @@ def _vision_extract_meta_from_pdf(pdf_path: Path) -> dict:
         except Exception:
             year = None
 
-        print(f"[VISION] parsed -> title={title!r} author={author!r} year={year!r}")
+        print(f"[VISION-IMG] parsed -> title={title!r} author={author!r} year={year!r}")
         return {"title": title, "author": author, "year": year}
     except Exception as e:
-        print(f"[VISION] error: {e}")
-
-        try:
-            pseudo = 120 * len(images)  # quy ước ~120 “đơn vị token” mỗi trang ảnh
-            globals().setdefault("_VISION_TOKEN_ACC", 0)
-            globals()["_VISION_TOKEN_ACC"] += int(pseudo)
-        except Exception:
-            pass
-
+        print(f"[VISION-IMG] error: {e}")
         return {}
 
 
 def guess_meta_from_pdf_content(pdf_path: Path) -> BookMeta:
-    """
-    Dùng Gemini (File API) đọc PDF trực tiếp để lấy metadata.
-    Nếu không ra title → fallback theo tên file.
-    """
-    data = _vision_extract_meta_from_pdf(pdf_path)
-    title  = data.get("title")  or None
-    author = data.get("author") or None
-    year   = data.get("year")   or None
+    data = _vision_extract_meta_from_image(pdf_path) or {}
+    title = (data.get("title") or "").strip() or pdf_path.stem
+    auth = data.get("author")
+    # tác giả có thể là list -> join
+    if isinstance(auth, (list, tuple)):
+        auth = ", ".join([str(a).strip() for a in auth if str(a).strip()])
+    elif isinstance(auth, str):
+        auth = auth.strip() or None
+    else:
+        auth = None
 
-    if not title:
-        fm = guess_meta_from_filename(pdf_path)
-        title  = fm.title
-        author = author or fm.author
-        year   = year or fm.year
+    year = data.get("year")
+    try:
+        year = int(year) if year not in (None, "") else None
+        if year and not (1000 <= year <= 2100):
+            year = None
+    except Exception:
+        year = None
 
-    return BookMeta(
-        title=_normalize_whitespace(title),
-        author=_normalize_whitespace(author) if author else None,
-        year=year,
-        source_pdf=pdf_path.name,
-    )
+    return BookMeta(title=title, author=auth, year=year, source_pdf=pdf_path.name)
 
 
 def ensure_collections(qc: QdrantClient):
@@ -614,6 +622,7 @@ def _already_indexed(qc: QdrantClient, book_id: str) -> dict:
 
 
 def ingest_pdf(pdf_path: Path, *, skip_if_exists: bool = True, force: bool = False, pages=None) -> dict:
+    global cap
     assert pdf_path.exists(), f"Not found: {pdf_path}"
     ensure_schema()
 
@@ -750,7 +759,7 @@ def ingest_pdf(pdf_path: Path, *, skip_if_exists: bool = True, force: bool = Fal
             hyde_meta: Optional[Dict] = None
             for j, chunk in enumerate(merged):
                 docs_texts.append(chunk)
-                usage["embedding_docs_tokens"] += _est_tokens(cap)  # hoặc _est_tokens(chunk)
+                usage["embedding_docs_tokens"] += _est_tokens(chunk)  # hoặc _est_tokens(chunk)
                 payload = {
                     "book_id": str(book_id),
                     "page_number": i + 1,
@@ -820,13 +829,13 @@ def ingest_pdf(pdf_path: Path, *, skip_if_exists: bool = True, force: bool = Fal
     try:
         # Lọc theo book_id ở cả hai key-path: root và metadata.*
         flt = qmodels.Filter(should=[
-            qmodels.FieldCondition(key="book_id",          match=qmodels.MatchValue(value=str(book_id))),
+            qmodels.FieldCondition(key="book_id", match=qmodels.MatchValue(value=str(book_id))),
             qmodels.FieldCondition(key="metadata.book_id", match=qmodels.MatchValue(value=str(book_id))),
         ])
 
         # Đếm số điểm trong từng collection
-        chunks_cnt = int(qc.count(collection_name=COLLECTION,       count_filter=flt).count or 0)
-        seeds_cnt  = int(qc.count(collection_name=SEED_COLLECTION,  count_filter=flt).count or 0)
+        chunks_cnt = int(qc.count(collection_name=COLLECTION, count_filter=flt).count or 0)
+        seeds_cnt = int(qc.count(collection_name=SEED_COLLECTION, count_filter=flt).count or 0)
 
         print("\n========== INGEST SUMMARY ==========")
         print(f"Book ID     : {book_id}")
