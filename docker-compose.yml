@@ -1,19 +1,40 @@
 version: "3.9"
+
 services:
+  ##backend:
+ ##   build: .
+  ##  container_name: metabook_backend
+  ##  restart: unless-stopped
+   ## ports:
+    ##  - "127.0.0.1:8000:8000"   # để Nginx truy cập qua localhost
+  ##  environment:
+   ##   DATABASE_URL: postgresql://postgres:husky@postgres:5432/postgres
+    ##  QDRANT_URL: http://qdrant:6333
+    ##depends_on:
+    ##  postgres:
+     ##   condition: service_healthy
+    ##  qdrant:
+    ##    condition: service_started
+    ##healthcheck:
+    ##  test: ["CMD-SHELL", "curl -fsS http://localhost:8000/ || exit 1"]
+    ##  interval: 10s
+   ##   timeout: 5s
+    ##  retries: 30
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
     restart: unless-stopped
     ports:
-      - "${QDRANT_PORT}:6333"
-      - "6334:6334"
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+      - "127.0.0.1:6334:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:6333/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+  #  healthcheck:
+   #   test: ["CMD", "wget", "-qO-", "http://localhost:6333/healthz"]
+     # interval: 5s
+      #timeout: 3s
+    #retries: 20
 
   postgres:
     image: postgres:16
@@ -24,7 +45,7 @@ services:
       POSTGRES_PASSWORD: husky
       POSTGRES_DB: postgres
     ports:
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:

@@ -443,11 +443,21 @@ def guess_meta_from_filename(pdf_path: Path) -> BookMeta:
 
 
 class GeminiEmb(GoogleGenerativeAIEmbeddings):
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return super().embed_documents(texts=texts, task_type="RETRIEVAL_DOCUMENT")
+    def embed_documents(self, texts: List[str], task_type: str = "retrieval_document", **kwargs):
+        # loại trùng nếu caller cũng truyền task_type
+        kwargs.pop("task_type", None)
+        try:
+            return super().embed_documents(texts=texts, task_type=task_type, **kwargs)
+        except TypeError:
+            # fallback cho bản lib cũ không hỗ trợ task_type
+            return super().embed_documents(texts=texts, **kwargs)
 
-    def embed_query(self, text: str) -> List[float]:
-        return super().embed_query(text=text, task_type="RETRIEVAL_QUERY")
+    def embed_query(self, text: str, task_type: str = "retrieval_query", **kwargs):
+        kwargs.pop("task_type", None)
+        try:
+            return super().embed_query(text=text, task_type=task_type, **kwargs)
+        except TypeError:
+            return super().embed_query(text=text, **kwargs)
 
 
 ENABLE_VISION_COVER = bool(int(os.getenv("ENABLE_VISION_COVER", "1")))

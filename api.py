@@ -12,6 +12,12 @@ from typing import List, Dict, Optional
 from uuid import uuid5, NAMESPACE_URL
 from fastapi import HTTPException, Query  # ✅ dùng Query, không phải QParam
 from fastapi.responses import FileResponse
+from app.ingest import ingest_pdf  # noqa: E402
+from app import ingest as ingest_mod  # dùng PG*, collection từ ingest.py  # noqa: E402
+from app.query import QueryEngine  # noqa: E402
+
+from sqlalchemy import create_engine, text as sql_text  # noqa: E402
+from qdrant_client import QdrantClient  # noqa: E402
 
 
 try:
@@ -42,15 +48,7 @@ if os.name == "nt":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
-from app.ingest import ingest_pdf  # noqa: E402
-from app import ingest as ingest_mod  # dùng PG*, collection từ ingest.py  # noqa: E402
-from app.query import QueryEngine  # noqa: E402
 
-from sqlalchemy import create_engine, text as sql_text  # noqa: E402
-from qdrant_client import QdrantClient  # noqa: E402
-
-# ---------------------------------------------------------
-# 4) FastAPI app & middlewares
 # ---------------------------------------------------------
 app = FastAPI(title="Books RAG API", version="0.1")
 

@@ -4,8 +4,8 @@ import json
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterable
+from collections import defaultdict
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -14,17 +14,18 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 
 # -------------------- config & logging --------------------
 load_dotenv()
-RAG_MIN_BEST_SCORE = float(os.getenv("RAG_MIN_BEST_SCORE", "0.15"))   # was 0.25
+RAG_MIN_BEST_SCORE = float(os.getenv("RAG_MIN_BEST_SCORE", "0.15"))  # was 0.25
 RAG_MIN_CONTEXT_CHARS = int(os.getenv("RAG_MIN_CONTEXT_CHARS", "300"))  # was 600
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 COLLECTION = os.getenv("QDRANT_COLLECTION", "books_rag")
 SEED_COLLECTION = os.getenv("QDRANT_SEED_COLLECTION", "book_rag_seed")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-004")
 API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+AUTO_METADATA_FIRST = str(os.getenv("AUTO_METADATA_FIRST", "1")).lower() in {"1", "true", "yes", "y"}
 GENAI_QUERY_MODEL = (
-    os.getenv("GENAI_QUERY_MODEL")
-    or os.getenv("GENAI_SUMMARY_MODEL")
-    or "gemini-2.5-flash"
+        os.getenv("GENAI_QUERY_MODEL")
+        or os.getenv("GENAI_SUMMARY_MODEL")
+        or "gemini-2.5-flash-lite"
 )
 
 logging.basicConfig(
@@ -35,16 +36,16 @@ log = logging.getLogger("query")
 
 # query.py (đầu file hoặc trong class)
 
-BOOK_ID_KEYS       = ["book_id", "metadata.book_id"]
-SECTION_ID_KEYS    = ["section_id", "metadata.section_id"]
-PAGE_NUMBER_KEYS   = ["page_number", "metadata.page_number"]
+BOOK_ID_KEYS = ["book_id", "metadata.book_id"]
+SECTION_ID_KEYS = ["section_id", "metadata.section_id"]
+PAGE_NUMBER_KEYS = ["page_number", "metadata.page_number"]
 SECTION_ORDER_KEYS = ["section_order", "metadata.section_order"]
-
 
 
 def _or_range(self, keys: list[str], gte=None, lte=None):
     rng = qmodels.Range(gte=gte, lte=lte)
     return [qmodels.FieldCondition(key=k, range=rng) for k in keys]
+
 
 # -------------------- datatypes --------------------
 @dataclass
@@ -100,10 +101,21 @@ class Hit:
 
 # -------------------- helpers --------------------
 class GeminiEmb(GoogleGenerativeAIEmbeddings):
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return super().embed_documents(texts=texts, task_type="RETRIEVAL_DOCUMENT")
-    def embed_query(self, text: str) -> List[float]:
-        return super().embed_query(text=text, task_type="RETRIEVAL_QUERY")
+    def embed_documents(self, texts: List[str], task_type: str = "retrieval_document", **kwargs):
+        # loại trùng nếu caller cũng truyền task_type
+        kwargs.pop("task_type", None)
+        try:
+            return super().embed_documents(texts=texts, task_type=task_type, **kwargs)
+        except TypeError:
+            # fallback cho bản lib cũ không hỗ trợ task_type
+            return super().embed_documents(texts=texts, **kwargs)
+
+    def embed_query(self, text: str, task_type: str = "retrieval_query", **kwargs):
+        kwargs.pop("task_type", None)
+        try:
+            return super().embed_query(text=text, task_type=task_type, **kwargs)
+        except TypeError:
+            return super().embed_query(text=text, **kwargs)
 
 
 def _llm(temp: float = 0.0) -> Optional[ChatGoogleGenerativeAI]:
@@ -111,11 +123,14 @@ def _llm(temp: float = 0.0) -> Optional[ChatGoogleGenerativeAI]:
         return None
     return ChatGoogleGenerativeAI(model=GENAI_QUERY_MODEL, google_api_key=API_KEY, temperature=temp)
 
+
 def _ensure_event_loop():
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 # -------------------- core engine --------------------
 class QueryEngine:
     def __init__(self, url: str = "http://localhost:", port: int = QDRANT_PORT):
@@ -150,6 +165,148 @@ class QueryEngine:
             return {"rewritten": rw, "keywords": kws}
         except Exception:
             return {"rewritten": question.strip(), "keywords": []}
+
+    # =========================================================
+    # CƠ CHẾ B: METADATA-FIRST (quét hết payload rồi mới trả lời)
+    # =========================================================
+
+    def _scroll_payloads_by_book(self, book_id: str, batch: int = 256, limit: int = 2048) -> List[dict]:
+        """
+        Lấy toàn bộ (hoặc phần lớn) payload của các points thuộc cùng book_id.
+        Không dùng vector; chỉ scroll theo filter book_id.
+        """
+        must = [qmodels.FieldCondition(key="book_id", match=qmodels.MatchValue(value=str(book_id)))]
+        flt = qmodels.Filter(must=must)
+
+        out: List[dict] = []
+        next_offset = None
+        fetched = 0
+
+        try:
+            while True:
+                points, next_offset = self.qc.scroll(
+                    collection_name=COLLECTION,  # hoặc COLLECTION nếu bạn dùng hằng
+                    scroll_filter=flt,
+                    with_payload=True,
+                    limit=min(batch, max(1, limit - fetched)),
+                    offset=next_offset
+                )
+                for p in (points or []):
+                    out.append(p.payload or {})
+                fetched += len(points or [])
+                if not next_offset or fetched >= limit or not (points or []):
+                    break
+        except Exception as e:
+            log.warning(f"[metadata-first] scroll payload failed: {e}")
+        return out
+
+    def _snapshot_metadata(self, payloads: Iterable[dict]) -> Dict[str, List[str]]:
+        """
+        Gom TẤT CẢ key/value xuất hiện trong payload thành snapshot dạng:
+        { key: [unique values (tối đa 5 cái)] }
+        """
+        acc: Dict[str, List[str]] = defaultdict(list)
+
+        def _push(k: str, v: Any):
+            if v is None:
+                return
+            if isinstance(v, (list, tuple, set)):
+                for x in v:
+                    _push(k, x)
+            else:
+                s = str(v).strip()
+                if s and s not in acc[k]:
+                    acc[k].append(s)
+
+        for pl in payloads:
+            for k, v in (pl or {}).items():
+                # Bỏ qua text quá dài để prompt gọn hơn
+                if isinstance(v, str) and len(v) > 400:
+                    continue
+                _push(k, v)
+
+        # Giới hạn 5 giá trị/ key để tránh prompt phình to
+        for k, vals in list(acc.items()):
+            if len(vals) > 5:
+                acc[k] = vals[:5]
+        return dict(acc)
+
+    def try_answer_from_all_metadata(self, question: str, book_id: Optional[str]) -> Optional[dict]:
+        """
+        Bước 0: luôn thử đọc & trả lời CHỈ từ metadata của book_id.
+        - Nếu LLM tự tin (confidence >= 0.8) => trả ngay.
+        - Nếu không => trả None để pipeline RAG tiếp tục như cũ.
+        """
+        if not (AUTO_METADATA_FIRST and book_id):
+            return None
+
+        # 1) Scroll tất cả (hoặc phần lớn) payload thuộc book_id
+        pls = self._scroll_payloads_by_book(book_id, batch=256, limit=2048)
+        if not pls:
+            return None
+
+        # 2) Gộp snapshot metadata
+        snapshot = self._snapshot_metadata(pls)
+        if not snapshot:
+            return None
+
+        # 3) Dựng "metadata_doc" gọn (mỗi key: v1 | v2 | v3)
+        lines = [f"{k}: " + " | ".join(vals) for k, vals in snapshot.items()]
+        metadata_doc = "\n".join(lines)[:8000]  # cắt đề phòng dài
+
+        # 4) Hỏi LLM với nhiệt độ 0 (deterministic hơn), chỉ dựa trên metadata_doc
+        prompt = (
+            "Bạn CHỈ được phép trả lời dựa trên METADATA dưới đây.\n"
+            "Nếu METADATA không đủ để trả lời chính xác, hãy trả về JSON:\n"
+            "{\"answer\":\"UNKNOWN\",\"confidence\":0}\n\n"
+            f"[QUESTION]\n{question}\n\n"
+            f"[METADATA]\n{metadata_doc}\n\n"
+            "Trả về JSON đúng mẫu:\n"
+            "{\n"
+            "  \"answer\": \"...\",      \n"
+            "  \"field\": \"...\",       \n"
+            "  \"evidence\": [\"...\"],  \n"
+            "  \"confidence\": 0.0       \n"
+            "}"
+        )
+
+        try:
+            llm_zero = _llm(0.0)  # dùng factory/tiện ích LLM đã có trong code bạn; nếu tên khác, đổi ở đây
+            resp = llm_zero.invoke(prompt)
+            content = getattr(resp, "content", str(resp))
+            data = json.loads(content)
+            ans = (data.get("answer") or "").strip()
+            conf = float(data.get("confidence") or 0.0)
+        except Exception as e:
+            log.warning(f"[metadata-first] LLM/parse failed: {e}")
+            return None
+
+        if not ans or ans.upper() == "UNKNOWN" or conf < 0.8:
+            return None
+
+        # 5) Dựng citation nhẹ (nếu đoán được field tương ứng)
+        field = (data.get("field") or "").strip()
+        citations: List[dict] = []
+        if field:
+            for pl in pls:
+                if field in pl and pl.get(field) is not None:
+                    citations.append({
+                        "page": pl.get("page_number") or pl.get("page_no"),
+                        "section": pl.get("section_id"),
+                        "heading": pl.get("heading") or pl.get("title"),
+                        "payload": {field: pl.get(field)}
+                    })
+                    if len(citations) >= 5:
+                        break
+
+        return {
+            "question": question,
+            "rewritten": question,  # không cần rewrite khi trả lời từ metadata
+            "answer": ans,
+            "context": "",  # không ghép context dài
+            "citations": citations,
+            "policy": {"metadata_first": True, "confidence": conf, "field": field},
+        }
 
     # -------- low-level search wrappers --------
     # trong QueryEngine
@@ -277,12 +434,37 @@ class QueryEngine:
         rescored.sort(key=lambda x: x[1], reverse=True)
         return rescored
 
+    @staticmethod
+    def _meta_header_from_hits(hits: Sequence[Hit]) -> str:
+        """Rút gọn metadata phổ biến từ payload để đưa vào đầu CONTEXT."""
+        KEYS = ("title", "author", "year", "publisher", "isbn", "printed_label", "source_pdf")
+        bag = {k: [] for k in KEYS}
+        for h in hits or []:
+            pl = h.payload or {}
+            for k in KEYS:
+                v = pl.get(k) or (pl.get("metadata", {}) or {}).get(k)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s and s not in bag[k]:
+                    bag[k].append(s)
+        lines = [f"{k}: " + " | ".join(vals[:3]) for k, vals in bag.items() if vals]
+        return "\n".join(lines[:8])
+
     # -------- context building & answer generation --------
     @staticmethod
     def build_context(hits: Sequence[Hit], max_chars: int = 10000) -> Tuple[str, List[Dict[str, Any]]]:
         ctx_parts: List[str] = []
         cites: List[Dict[str, Any]] = []
         used = 0
+
+        # ✅ Thêm METADATA HEADER (nếu có) vào đầu context để LLM được phép dùng
+        meta_header = QueryEngine._meta_header_from_hits(hits)
+        if meta_header:
+            header = "[METADATA]\n" + meta_header + "\n"
+            ctx_parts.append(header)
+            used += len(header)
+
         for h in hits:
             txt = (h.text or "").strip()
             if not txt:
@@ -296,14 +478,18 @@ class QueryEngine:
             ctx_parts.append(f"{frag}\n{tag}")
             cites.append({
                 "page": h.page,
+                "section": h.section_id,
                 "heading": h.heading,
-                "section_id": h.section_id,
                 "score": h.score,
-                "type": h.node_type,
+                "node_type": h.node_type
             })
             if used >= max_chars:
                 break
-        return "\n\n".join(ctx_parts).strip(), cites
+
+        txt = "\n\n".join(ctx_parts).strip()
+        if len(txt) > max_chars:
+            txt = txt[:max_chars]
+        return txt, cites
 
     def _make_quote_from_hits(self, hits, max_chars=400) -> str:
         if not hits:
@@ -328,7 +514,7 @@ class QueryEngine:
   "support": {
     "quote": "< Một vài trích đoạn ngắn (≤6000 ký tự) trực tiếp hỗ trợ cho câu trả lời; mỗi trích đoạn kết thúc bằng xuống dòng. Ưu tiên NGUYÊN VĂN từ CONTEXT >",
   },
-  "answer": "<câu trả lời ngắn gọn, CHỈ dựa trên CONTEXT>",
+  "answer": "<câu trả lời ngắn gọn, CHỈ dựa trên CONTEXT và các metadata trong các collection như là author , title>",
   "quiz": [
     {
       "question": "Câu hỏi (dựa 100% vào CONTEXT, không suy đoán)",
@@ -365,6 +551,7 @@ QUY TẮC:
 
 - KHÔNG thêm bất kỳ văn bản nào ngoài JSON (không markdown, không giải thích, không tiền tố/hậu tố).
 - Tuyệt đối không suy đoán ngoài CONTEXT.
+- Nếu đầu CONTEXT có khối [METADATA] (ví dụ title/author/year…), bạn ĐƯỢC PHÉP dùng chính xác các giá trị đó như một phần của CONTEXT.
 
 Bạn sẽ nhận:
 <QUESTION>...</QUESTION>
@@ -373,8 +560,8 @@ Chỉ dựa vào CONTEXT để tạo JSON ở trên.
 """
         if not self.llm:
             return (
-                "[NO LLM KEY]\n"
-                "Below is a stitched context from retrieval; manually inspect citations.\n\n" + context
+                    "[NO LLM KEY]\n"
+                    "Below is a stitched context from retrieval; manually inspect citations.\n\n" + context
             )
         prompt = (
             f"<SYSTEM>\n{sys_prompt}\n</SYSTEM>\n\n"
@@ -456,6 +643,7 @@ Chỉ dựa vào CONTEXT để tạo JSON ở trên.
         # 5) Rerank và distinct
         rescored = self.rerank(self._distinct_by_text(chunk_hits), ranked_sections=sec_ids)
         return [h for (h, _) in rescored]
+
     def direct_retrieve(self, qvec: List[float], book_id: Optional[str], k: int = 24) -> List[Hit]:
         hits = self._search(COLLECTION, qvec, k=k, flt=self._filter_book(book_id))
         return self._distinct_by_text(hits)
@@ -499,19 +687,26 @@ Chỉ dựa vào CONTEXT để tạo JSON ở trên.
                   target_chars: int = 6000, dry_run: bool = False) -> Dict[str, Any]:
         log.info(f"run_query question={question!r} book_id={book_id} k={k} dry_run={dry_run}")
 
-        # 1) rewrite
+        # 1) REWRITE (giữ nguyên)
         rw = self.rewrite_query(question)
         qtext = rw.get("rewritten", question)
         if rw.get("keywords"):
             log.info(f"rewrite: {qtext} | keywords={rw['keywords']}")
 
-        # 2) embed
+        # 1.5) METADATA-FIRST — thử trả lời CHỈ từ metadata (chưa embed, chưa search)
+        meta = self.try_answer_from_all_metadata(qtext, book_id)
+        if meta:
+            # đảm bảo FE vẫn thấy câu đã rewrite
+            meta["rewritten"] = qtext
+            return meta
+
+        # 2) EMBED (chạy khi metadata không đủ)
         qvec = self.emb.embed_query(qtext)
 
-        # 3) retrieve (iterative seed/summary/direct)
+        # 3) RETRIEVE (giữ nguyên)
         hits = self.iterative_retrieval(qvec, book_id, target_chars=target_chars)
 
-        # 4) negative-rejection check (configurable & non-destructive)
+        # 4) NEGATIVE-REJECTION (giữ nguyên)
         best_score = max([h.score for h in hits], default=0.0)
         context, citations = self.build_context(hits, max_chars=target_chars)
 
@@ -525,8 +720,8 @@ Chỉ dựa vào CONTEXT để tạo JSON ở trên.
                 "question": question,
                 "rewritten": qtext,
                 "answer": answer,
-                "context": context,  # giữ nguyên context thu được
-                "citations": citations,  # bổ sung trích dẫn cho frontend
+                "context": context,
+                "citations": citations,
                 "policy": {
                     "negative_rejection": True,
                     "best_score": best_score,
@@ -537,7 +732,7 @@ Chỉ dựa vào CONTEXT để tạo JSON ở trên.
                 },
             }
 
-        # 5) generate
+        # 5) GENERATE (giữ nguyên)
         answer = self.generate(question, context)
 
         return {
@@ -575,13 +770,6 @@ def _format_answer_md(out: Dict[str, Any]) -> str:
         lines.append(f"- p.{pg}{' — ' + hd if hd else ''}{tag}")
     src = "\n".join(lines)
     return f"{ans}\n\n**Nguồn trích**\n{src}"
-
-
-def run_query(question: str, k: int = 20, book_id: Optional[str] = None) -> str:
-    """Simple wrapper used by Streamlit app. Returns Markdown string only."""
-    eng = QueryEngine()
-    out = eng.run_query(question=question, book_id=book_id, k=k, target_chars=3200)
-    return _format_answer_md(out)
 
 
 # -------------------- CLI --------------------
